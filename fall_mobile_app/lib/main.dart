@@ -1,16 +1,11 @@
-import 'package:flutter/material.dart';
 import 'dart:async';
-import 'dart:convert';
-import 'package:mqtt_client/mqtt_client.dart';
-import 'package:mqtt_client/mqtt_server_client.dart';
+
 import 'package:fl_chart/fl_chart.dart';
-import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter/services.dart' show rootBundle;
-import 'package:csv/csv.dart';
-import 'csv_service.dart';
-import 'dart:math';
+import 'package:url_launcher/url_launcher.dart';
+
+import 'sqlite_sensor_service.dart';
 
 void main() => runApp(const FallSenseApp());
 
@@ -38,7 +33,7 @@ class MainNavigation extends StatefulWidget {
 }
 
 class _MainNavigationState extends State<MainNavigation> {
-  int _selectedIndex = 0; // Mặc định mở Dashboard
+  int _selectedIndex = 0;
 
   final List<Widget> _pages = [
     const DashboardPage(),
@@ -101,19 +96,121 @@ class _MainNavigationState extends State<MainNavigation> {
   }
 }
 
-// --- TRANG DASHBOARD (GIAO DIỆN GIỐNG WEB) ---
-class DashboardPage extends StatelessWidget {
+// --- TRANG DASHBOARD ---
+class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    final List<Map<String, String>> recentData = [
-      {"time": "14:20:01", "amag": "1.02", "status": "Ổn định"},
-      {"time": "14:20:05", "amag": "3.85", "status": "Cảnh báo"},
-      {"time": "14:20:10", "amag": "0.98", "status": "Ổn định"},
-      {"time": "14:20:15", "amag": "1.15", "status": "Ổn định"},
-    ];
+  State<DashboardPage> createState() => _DashboardPageState();
+}
 
+class _DashboardPageState extends State<DashboardPage> {
+  final SQLiteSensorService _sensorService = SQLiteSensorService();
+
+  Timer? _refreshTimer;
+  bool _isLoading = true;
+  String _sourceStatus = "Dang ket noi SQLite...";
+  int _totalRecords = 0;
+  double _averageAmag = 0;
+  List<FlSpot> _chartSpots = [const FlSpot(0, 0)];
+  List<Map<String, String>> _recentData = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDashboardData();
+
+    _refreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _loadDashboardData(showLoader: false);
+    });
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadDashboardData({bool showLoader = true}) async {
+    if (!mounted) return;
+    if (showLoader) {
+      setState(() => _isLoading = true);
+    }
+
+    try {
+      final dbPath = await _sensorService.resolveDatabasePath();
+      if (dbPath == null) {
+        if (!mounted) return;
+        setState(() {
+          _sourceStatus = "Khong tim thay sensor_data.db";
+          _totalRecords = 0;
+          _averageAmag = 0;
+          _chartSpots = [const FlSpot(0, 0)];
+          _recentData = [];
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final summary = await _sensorService.loadSummary();
+      final latestRows = await _sensorService.loadLatestRecords(limit: 500);
+      if (!mounted) return;
+
+      if (summary == null || latestRows.isEmpty) {
+        setState(() {
+          _sourceStatus = "Da ket noi SQLite, chua co du lieu sensor";
+          _totalRecords = summary?.totalRecords ?? 0;
+          _averageAmag = summary?.averageAmag ?? 0;
+          _chartSpots = [const FlSpot(0, 0)];
+          _recentData = [];
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final chartRows = latestRows.length > 60
+          ? latestRows.sublist(latestRows.length - 60)
+          : latestRows;
+      final spots = <FlSpot>[];
+      var x = 0.0;
+      for (final row in chartRows) {
+        spots.add(FlSpot(x, row.amag));
+        x += 1;
+      }
+
+      final latest = latestRows.last;
+      final latestStatus = latest.label == 1
+          ? "⚠️ PHAT HIEN TE NGA"
+          : "✅ Binh thuong";
+      final recentRows = latestRows.reversed.take(10);
+
+      setState(() {
+        _sourceStatus = "$latestStatus | SQLite";
+        _totalRecords = summary.totalRecords;
+        _averageAmag = summary.averageAmag;
+        _chartSpots = spots;
+        _recentData = recentRows
+            .map(
+              (row) => {
+                "time": row.timeLabel,
+                "amag": row.amag.toStringAsFixed(2),
+                "status": row.label == 1 ? "Cảnh báo" : "Ổn định",
+              },
+            )
+            .toList();
+        _isLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _sourceStatus = "Loi doc SQLite: $e";
+        _isLoading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
       child: Column(
@@ -123,24 +220,39 @@ class DashboardPage extends StatelessWidget {
             "📊 Dashboard Phân tích",
             style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
           ),
+          const SizedBox(height: 8),
+          Text(
+            _sourceStatus,
+            style: TextStyle(
+              color:
+                  _sourceStatus.startsWith("Loi") ||
+                      _sourceStatus.startsWith("Khong")
+                  ? Colors.redAccent
+                  : const Color(0xFF00FFD0),
+            ),
+          ),
           const SizedBox(height: 20),
           Row(
             children: [
               _buildMetricCard(
                 "Tổng bản ghi",
-                "1,240",
+                _totalRecords.toString(),
                 Icons.description,
                 Colors.blue,
               ),
               const SizedBox(width: 15),
               _buildMetricCard(
                 "Trung bình Amag",
-                "1.05g",
+                "${_averageAmag.toStringAsFixed(2)}g",
                 Icons.speed,
                 Colors.green,
               ),
             ],
           ),
+          if (_isLoading) ...[
+            const SizedBox(height: 10),
+            const LinearProgressIndicator(color: Color(0xFF00FFD0)),
+          ],
           const SizedBox(height: 25),
           const Text(
             "Biểu đồ Gia tốc tổng hợp (Amag)",
@@ -161,20 +273,13 @@ class DashboardPage extends StatelessWidget {
                 borderData: FlBorderData(show: false),
                 lineBarsData: [
                   LineChartBarData(
-                    spots: const [
-                      FlSpot(0, 1),
-                      FlSpot(1, 1.2),
-                      FlSpot(2, 1),
-                      FlSpot(3, 3.8),
-                      FlSpot(4, 1.1),
-                      FlSpot(5, 0.9),
-                    ],
+                    spots: _chartSpots,
                     isCurved: true,
                     color: const Color(0xFF00FFD0),
                     barWidth: 3,
                     belowBarData: BarAreaData(
                       show: true,
-                      color: const Color(0xFF00FFD0).withOpacity(0.1),
+                      color: const Color(0xFF00FFD0).withValues(alpha: 0.1),
                     ),
                   ),
                 ],
@@ -193,45 +298,49 @@ class DashboardPage extends StatelessWidget {
               color: const Color(0xFF1A1A1A),
               borderRadius: BorderRadius.circular(15),
             ),
-            child: DataTable(
-              columns: const [
-                DataColumn(
-                  label: Text(
-                    "Thời gian",
-                    style: TextStyle(color: Color(0xFF00FFD0)),
+            // ĐÂY LÀ ĐOẠN ĐÃ FIX: Bọc SingleChildScrollView cho DataTable
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: DataTable(
+                columns: const [
+                  DataColumn(
+                    label: Text(
+                      "Thời gian",
+                      style: TextStyle(color: Color(0xFF00FFD0)),
+                    ),
                   ),
-                ),
-                DataColumn(
-                  label: Text(
-                    "Amag",
-                    style: TextStyle(color: Color(0xFF00FFD0)),
+                  DataColumn(
+                    label: Text(
+                      "Amag",
+                      style: TextStyle(color: Color(0xFF00FFD0)),
+                    ),
                   ),
-                ),
-                DataColumn(
-                  label: Text(
-                    "Trạng thái",
-                    style: TextStyle(color: Color(0xFF00FFD0)),
+                  DataColumn(
+                    label: Text(
+                      "Trạng thái",
+                      style: TextStyle(color: Color(0xFF00FFD0)),
+                    ),
                   ),
-                ),
-              ],
-              rows: recentData.map((data) {
-                return DataRow(
-                  cells: [
-                    DataCell(Text(data["time"]!)),
-                    DataCell(Text(data["amag"]!)),
-                    DataCell(
-                      Text(
-                        data["status"]!,
-                        style: TextStyle(
-                          color: data["status"] == "Cảnh báo"
-                              ? Colors.red
-                              : Colors.green,
+                ],
+                rows: _recentData.map((data) {
+                  return DataRow(
+                    cells: [
+                      DataCell(Text(data["time"]!)),
+                      DataCell(Text(data["amag"]!)),
+                      DataCell(
+                        Text(
+                          data["status"]!,
+                          style: TextStyle(
+                            color: data["status"] == "Cảnh báo"
+                                ? Colors.red
+                                : Colors.green,
+                          ),
                         ),
                       ),
-                    ),
-                  ],
-                );
-              }).toList(),
+                    ],
+                  );
+                }).toList(),
+              ),
             ),
           ),
         ],
@@ -282,16 +391,14 @@ class BalancePage extends StatefulWidget {
 }
 
 class _BalancePageState extends State<BalancePage> {
-  // Controller quản lý ô nhập liệu
   final TextEditingController _phoneController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _loadSavedPhone(); // Tự động load số khi mở trang
+    _loadSavedPhone();
   }
 
-  // Hàm đọc số từ bộ nhớ máy
   Future<void> _loadSavedPhone() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
@@ -299,7 +406,6 @@ class _BalancePageState extends State<BalancePage> {
     });
   }
 
-  // Hàm lưu số vào bộ nhớ máy
   Future<void> _savePhoneNumber() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('sos_phone', _phoneController.text);
@@ -313,7 +419,6 @@ class _BalancePageState extends State<BalancePage> {
     }
   }
 
-  // Giữ nguyên hàm chẩn đoán của bạn
   void _showSystemCheckDialog(BuildContext context) {
     showDialog(
       context: context,
@@ -407,7 +512,6 @@ class _BalancePageState extends State<BalancePage> {
           ),
           const SizedBox(height: 20),
 
-          // --- PHẦN MỚI THÊM: QUẢN LÝ LIÊN HỆ ---
           const Text(
             "Cài đặt liên hệ SOS",
             style: TextStyle(color: Colors.grey, fontSize: 16),
@@ -419,7 +523,7 @@ class _BalancePageState extends State<BalancePage> {
               color: const Color(0xFF1A1A1A),
               borderRadius: BorderRadius.circular(20),
               border: Border.all(
-                color: const Color(0xFF00FFD0).withOpacity(0.2),
+                color: const Color(0xFF00FFD0).withValues(alpha: 0.2),
               ),
             ),
             child: Row(
@@ -454,7 +558,6 @@ class _BalancePageState extends State<BalancePage> {
 
           const SizedBox(height: 30),
 
-          // --- GIỮ NGUYÊN PHẦN THỐNG KÊ CỦA BẠN ---
           const Text(
             "Thống kê cứu trợ",
             style: TextStyle(color: Colors.grey, fontSize: 16),
@@ -480,7 +583,6 @@ class _BalancePageState extends State<BalancePage> {
 
           const SizedBox(height: 30),
 
-          // --- GIỮ NGUYÊN PHẦN SỨC KHỎE THIẾT BỊ CỦA BẠN ---
           const Text(
             "Sức khỏe thiết bị",
             style: TextStyle(color: Colors.grey, fontSize: 16),
@@ -520,7 +622,6 @@ class _BalancePageState extends State<BalancePage> {
 
           const SizedBox(height: 30),
 
-          // --- GIỮ NGUYÊN NÚT KIỂM TRA ĐỊNH KỲ CỦA BẠN ---
           SizedBox(
             width: double.infinity,
             height: 55,
@@ -550,7 +651,6 @@ class _BalancePageState extends State<BalancePage> {
     );
   }
 
-  // --- GIỮ NGUYÊN CÁC HÀM HELPER WIDGETS ---
   Widget _buildMetricCard(
     String title,
     String value,
@@ -563,7 +663,7 @@ class _BalancePageState extends State<BalancePage> {
         decoration: BoxDecoration(
           color: const Color(0xFF1A1A1A),
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: color.withOpacity(0.3), width: 1),
+          border: Border.all(color: color.withValues(alpha: 0.3), width: 1),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -618,132 +718,111 @@ class RealtimeDataPage extends StatefulWidget {
 }
 
 class _RealtimeDataPageState extends State<RealtimeDataPage> {
-  // Biến dữ liệu
+  final SQLiteSensorService _sensorService = SQLiteSensorService();
+
   List<FlSpot> amagPoints = [const FlSpot(0, 0)];
   double xValue = 0;
   double currentAmag = 1.0;
   int currentLabel = 0;
   String currentBehavior = "STD";
-
-  // Biến điều khiển giả lập CSV
-  bool isFalling =
-      false; // Biến cờ để ngăn lưu trùng lặp nhiều dòng cho 1 lần ngã
-  List<List<dynamic>> _csvData = [];
-  int _currentRow = 1; // Bỏ qua tiêu đề (row 0)
-  Timer? _simulationTimer;
+  int _currentRecordId = 0;
+  String _sourceStatus = "Dang ket noi SQLite...";
+  Timer? _pollingTimer;
 
   @override
   void initState() {
     super.initState();
-    _startSimulation();
+    _startRealtimePolling();
   }
 
   @override
   void dispose() {
-    _simulationTimer?.cancel();
+    _pollingTimer?.cancel();
     super.dispose();
   }
 
-  // Hàm đọc CSV và bắt đầu chạy dữ liệu
-  // --- HÀM GIẢ LẬP ĐỌC DỮ LIỆU ---
-  Future<void> _startSimulation() async {
-    // 1. Tải dữ liệu từ file CSV qua Service
-    _csvData = await CSVService().loadCSVData();
+  Future<void> _startRealtimePolling() async {
+    await _loadBootstrapData();
+    if (!mounted) return;
 
-    // 2. Thiết lập Timer để đọc dữ liệu mỗi 100ms
-    _simulationTimer = Timer.periodic(const Duration(milliseconds: 100), (
-      timer,
-    ) {
-      if (_currentRow < _csvData.length) {
-        final row = _csvData[_currentRow];
-
-        // Bỏ qua nếu dòng dữ liệu không đủ cột (yêu cầu ít nhất 7 cột)
-        if (row.length < 7) {
-          _currentRow++;
-          return;
-        }
-
-        if (!mounted) return; // Kiểm tra nếu widget còn tồn tại
-
-        setState(() {
-          // --- A. TRÍCH XUẤT DỮ LIỆU ---
-          // Format trong file của bạn: temp, accX, accY, accZ, angleX, angleY, label
-          double ax = double.tryParse(row[1].toString()) ?? 0.0;
-          double ay = double.tryParse(row[2].toString()) ?? 0.0;
-          double az = double.tryParse(row[3].toString()) ?? 0.0;
-          currentLabel = int.tryParse(row[6].toString().trim()) ?? 0;
-
-          // --- B. TÍNH TOÁN AMAG ---
-          currentAmag = sqrt(ax * ax + ay * ay + az * az);
-
-          // --- C. LOGIC PHÂN LOẠI HÀNH VI & LƯU LỊCH SỬ ---
-          if (currentLabel == 1) {
-            // NHÓM PHÁT HIỆN TÉ NGÃ (Label = 1)
-            if (ax.abs() > ay.abs() && ax.abs() > az.abs()) {
-              currentBehavior = "FOL"; // Ngã sấp/ngửa
-            } else if (ay.abs() > ax.abs() && ay.abs() > az.abs()) {
-              currentBehavior = "SDL"; // Ngã sang bên
-            } else {
-              currentBehavior = "FKL"; // Ngã khuỵu
-            }
-
-            // CHỈ LƯU VÀO HISTORY KHI MỚI BẮT ĐẦU NGÃ (Chống lưu lặp lại)
-            if (!isFalling) {
-              _saveToHistory(currentBehavior, currentAmag);
-              isFalling = true; // Khóa lại cho đến khi Label về 0
-            }
-          } else {
-            // NHÓM TRẠNG THÁI AN TOÀN (Label = 0)
-            isFalling = false; // Reset biến cờ khi quay lại an toàn
-
-            if (currentAmag > 2.5) {
-              currentBehavior = "JUM"; // Nhảy
-            } else if (currentAmag > 1.8) {
-              currentBehavior = "JOG"; // Chạy
-            } else if (currentAmag > 1.15) {
-              currentBehavior = "WAL"; // Đi bộ
-            } else if (currentAmag < 0.85) {
-              currentBehavior = "CSI"; // Ra/vào xe
-            } else {
-              currentBehavior = "STD"; // Đứng yên
-            }
-          }
-
-          // --- D. CẬP NHẬT BIỂU ĐỒ ---
-          xValue++;
-          amagPoints.add(FlSpot(xValue, currentAmag));
-          if (amagPoints.length > 30) {
-            amagPoints.removeAt(0); // Giữ biểu đồ luôn trôi
-          }
-        });
-
-        _currentRow++;
-      } else {
-        _currentRow = 1; // Hết file thì quay lại từ đầu
-      }
+    _pollingTimer = Timer.periodic(const Duration(milliseconds: 600), (_) {
+      _pollLatestRecord();
     });
   }
 
-  // --- HÀM LƯU LỊCH SỬ (Định nghĩa duy nhất một lần trong class) ---
-  Future<void> _saveToHistory(String behavior, double amag) async {
+  Future<void> _loadBootstrapData() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      List<String> history = prefs.getStringList('fall_history') ?? [];
+      final dbPath = await _sensorService.resolveDatabasePath();
+      if (dbPath == null) {
+        if (!mounted) return;
+        setState(() => _sourceStatus = "Khong tim thay sensor_data.db");
+        return;
+      }
 
-      // Tạo chuỗi lưu trữ có cấu trúc để trang History dễ đọc
-      String timestamp = DateTime.now().toString().split('.')[0];
-      String record =
-          "$timestamp | $behavior | Amag: ${amag.toStringAsFixed(2)}";
+      final rows = await _sensorService.loadLatestRecords(limit: 30);
+      if (!mounted) return;
 
-      history.insert(0, record); // Đưa dữ liệu mới lên đầu
+      if (rows.isEmpty) {
+        setState(() {
+          _sourceStatus = "Da ket noi DB, chua co du lieu sensor";
+          amagPoints = [const FlSpot(0, 0)];
+          xValue = 0;
+          _currentRecordId = 0;
+        });
+        return;
+      }
 
-      // Giới hạn 50 bản ghi cho nhẹ bộ nhớ
-      if (history.length > 50) history = history.sublist(0, 50);
+      final spots = <FlSpot>[];
+      var nextX = 0.0;
+      for (final row in rows) {
+        nextX += 1;
+        spots.add(FlSpot(nextX, row.amag));
+      }
 
-      await prefs.setStringList('fall_history', history);
-      debugPrint("System: Đã ghi nhận sự cố vào lịch sử.");
+      setState(() {
+        _sourceStatus = "● Dang doc du lieu tu SQLite";
+        amagPoints = spots;
+        xValue = nextX;
+        _applyRecordState(rows.last, appendPoint: false);
+      });
     } catch (e) {
-      debugPrint("Error saving history: $e");
+      if (!mounted) return;
+      setState(() => _sourceStatus = "Loi doc SQLite: $e");
+    }
+  }
+
+  Future<void> _pollLatestRecord() async {
+    try {
+      final latest = await _sensorService.loadLatestRecord();
+      if (!mounted || latest == null) {
+        return;
+      }
+      if (latest.id <= _currentRecordId) {
+        return;
+      }
+
+      setState(() {
+        _sourceStatus = "● Dang doc du lieu tu SQLite";
+        _applyRecordState(latest, appendPoint: true);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _sourceStatus = "Loi doc SQLite: $e");
+    }
+  }
+
+  void _applyRecordState(SensorRecord row, {required bool appendPoint}) {
+    _currentRecordId = row.id;
+    currentAmag = row.amag;
+    currentLabel = row.label;
+    currentBehavior = row.label == 1 ? "FALL" : "STD";
+
+    if (appendPoint) {
+      xValue += 1;
+      amagPoints.add(FlSpot(xValue, currentAmag));
+      if (amagPoints.length > 30) {
+        amagPoints.removeAt(0);
+      }
     }
   }
 
@@ -756,14 +835,8 @@ class _RealtimeDataPageState extends State<RealtimeDataPage> {
 
   String _getBehaviorName(String code) {
     Map<String, String> names = {
-      "FOL": "Ngã sấp",
-      "FKL": "Ngã khuỵu",
-      "SDL": "Ngã bên",
-      "BSC": "Ngã ngồi",
-      "STD": "Đứng yên",
-      "WAL": "Đi bộ",
-      "JOG": "Chạy",
-      "JUM": "Nhảy",
+      "FALL": "Phat hien te nga",
+      "STD": "Binh thuong",
     };
     return names[code] ?? "Ổn định";
   }
@@ -778,16 +851,23 @@ class _RealtimeDataPageState extends State<RealtimeDataPage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Column(
+              Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    "Giám sát CSV Realtime",
+                  const Text(
+                    "Giam sat SQLite Realtime",
                     style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
                   ),
                   Text(
-                    "● Đang đọc dữ liệu",
-                    style: TextStyle(color: Color(0xFF00FFD0), fontSize: 14),
+                    _sourceStatus,
+                    style: TextStyle(
+                      color:
+                          _sourceStatus.startsWith("Loi") ||
+                              _sourceStatus.startsWith("Khong")
+                          ? Colors.redAccent
+                          : const Color(0xFF00FFD0),
+                      fontSize: 14,
+                    ),
                   ),
                 ],
               ),
@@ -803,8 +883,6 @@ class _RealtimeDataPageState extends State<RealtimeDataPage> {
             ],
           ),
           const SizedBox(height: 20),
-
-          // Biểu đồ Amag
           Expanded(
             flex: 2,
             child: Container(
@@ -833,7 +911,7 @@ class _RealtimeDataPageState extends State<RealtimeDataPage> {
                             (currentLabel == 1
                                     ? Colors.red
                                     : const Color(0xFF00FFD0))
-                                .withOpacity(0.1),
+                                .withValues(alpha: 0.1),
                       ),
                     ),
                   ],
@@ -841,10 +919,7 @@ class _RealtimeDataPageState extends State<RealtimeDataPage> {
               ),
             ),
           ),
-
           const SizedBox(height: 20),
-
-          // Bảng trạng thái Hành vi
           Container(
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
@@ -898,9 +973,7 @@ class _RealtimeDataPageState extends State<RealtimeDataPage> {
               ],
             ),
           ),
-
           const SizedBox(height: 20),
-
           Row(
             children: [
               _buildStatCard(
@@ -910,8 +983,8 @@ class _RealtimeDataPageState extends State<RealtimeDataPage> {
               ),
               const SizedBox(width: 15),
               _buildStatCard(
-                "Dòng CSV",
-                "$_currentRow",
+                "Record ID",
+                "$_currentRecordId",
                 Icons.list_alt,
                 color: Colors.blue,
               ),
@@ -958,88 +1031,112 @@ class HistoryPage extends StatefulWidget {
 }
 
 class _HistoryPageState extends State<HistoryPage> {
+  final SQLiteSensorService _sensorService = SQLiteSensorService();
+
   String _selectedFilter = 'Tất cả';
   List<Map<String, dynamic>> _allLogs = [];
   bool _isLoading = true;
+  String _historyStatus = '';
+  Timer? _refreshTimer;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _loadLogsFromStorage(); // Tự động load lại dữ liệu mỗi khi tab được hiển thị
+    _loadLogsFromStorage(showLoader: false);
   }
 
   @override
   void initState() {
     super.initState();
     _loadLogsFromStorage();
-  }
 
-  // --- HÀM ĐỌC DỮ LIỆU THỰC TẾ TỪ BỘ NHỚ ---
-  Future<void> _loadLogsFromStorage() async {
-    if (!mounted) return;
-    setState(() => _isLoading = true);
-
-    final prefs = await SharedPreferences.getInstance();
-    List<String> storedLogs = prefs.getStringList('fall_history') ?? [];
-
-    // Chuyển đổi dữ liệu từ SharedPreferences thành List Map để hiển thị
-    List<Map<String, dynamic>> dynamicLogs = storedLogs
-        .map((logString) {
-          try {
-            final parts = logString.split(' | ');
-            return {
-              "time": parts[0].contains(' ')
-                  ? parts[0].split(' ')[1]
-                  : parts[0],
-              "date": parts[0].contains(' ')
-                  ? parts[0].split(' ')[0]
-                  : "08/02/2026",
-              "event": "CẢNH BÁO: PHÁT HIỆN NGÃ (${parts[1]})",
-              "value": parts[2].replaceFirst("Amag: ", "") + "g",
-              "type": "alert",
-              "axis": "Phân tích từ cảm biến",
-            };
-          } catch (e) {
-            return null;
-          }
-        })
-        .whereType<Map<String, dynamic>>()
-        .toList();
-
-    // Dữ liệu hệ thống mẫu (luôn xuất hiện cuối cùng)
-    List<Map<String, dynamic>> systemLogs = [
-      {
-        "time": "08:00:00",
-        "date": "08/02/2026",
-        "event": "HỆ THỐNG KHỞI ĐỘNG",
-        "value": "1.00g",
-        "type": "system",
-        "axis": "Thiết bị sẵn sàng",
-      },
-    ];
-
-    setState(() {
-      // Ưu tiên dữ liệu ngã thật (dynamicLogs) lên trên đầu
-      _allLogs = [...dynamicLogs, ...systemLogs];
-      _isLoading = false;
+    _refreshTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _loadLogsFromStorage(showLoader: false);
     });
   }
 
-  // --- HÀM XÓA LỊCH SỬ ---
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadLogsFromStorage({bool showLoader = true}) async {
+    if (!mounted) return;
+    if (showLoader) {
+      setState(() => _isLoading = true);
+    }
+
+    try {
+      final dbPath = await _sensorService.resolveDatabasePath();
+      if (dbPath == null) {
+        if (!mounted) return;
+        setState(() {
+          _allLogs = [];
+          _historyStatus = 'Khong tim thay sensor_data.db';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      final fallEvents = await _sensorService.loadFallEvents(limit: 100);
+      if (!mounted) return;
+
+      final dynamicLogs = fallEvents
+          .map(
+            (event) => {
+              "time": event.timeLabel,
+              "date": event.dateLabel,
+              "event": "CẢNH BÁO: PHÁT HIỆN NGÃ (ID ${event.id})",
+              "value": "${event.amag.toStringAsFixed(2)}g",
+              "type": "alert",
+              "axis":
+                  "GocX ${event.angleX.toStringAsFixed(1)}°, GocY ${event.angleY.toStringAsFixed(1)}°",
+            },
+          )
+          .toList();
+
+      final systemLogs = <Map<String, dynamic>>[
+        {
+          "time": "--:--:--",
+          "date": "-",
+          "event": "NGUON DU LIEU SQLITE",
+          "value": "sensor_data.db",
+          "type": "system",
+          "axis": "Dong bo truc tiep tu backend",
+        },
+      ];
+
+      setState(() {
+        _allLogs = [...dynamicLogs, ...systemLogs];
+        _historyStatus = fallEvents.isEmpty
+            ? 'Da ket noi SQLite, chua co su kien te nga'
+            : 'Dang dong bo lich su tu SQLite';
+        _isLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _allLogs = [];
+        _historyStatus = 'Loi doc SQLite: $e';
+        _isLoading = false;
+      });
+    }
+  }
+
   Future<void> _clearLogs() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('fall_history');
-    _loadLogsFromStorage(); // Load lại trang
+    await _loadLogsFromStorage(showLoader: false);
     if (mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text("✅ Đã xóa sạch nhật ký")));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Du lieu dang dong bo truc tiep tu SQLite (chi doc)"),
+        ),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    // Logic lọc dữ liệu dựa trên Chip được chọn
     List<Map<String, dynamic>> filteredLogs = _allLogs.where((log) {
       if (_selectedFilter == 'Tất cả') return true;
       if (_selectedFilter == 'Cảnh báo') return log['type'] == 'alert';
@@ -1063,9 +1160,11 @@ class _HistoryPageState extends State<HistoryPage> {
                     "📜 Nhật Ký Hệ Thống",
                     style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
                   ),
-                  const Text(
-                    "Lịch sử sự cố ghi nhận từ thiết bị",
-                    style: TextStyle(color: Colors.grey, fontSize: 14),
+                  Text(
+                    _historyStatus.isEmpty
+                        ? "Lich su su co ghi nhan tu thiet bi"
+                        : _historyStatus,
+                    style: const TextStyle(color: Colors.grey, fontSize: 14),
                   ),
                 ],
               ),
@@ -1080,8 +1179,6 @@ class _HistoryPageState extends State<HistoryPage> {
             ],
           ),
           const SizedBox(height: 25),
-
-          // Thanh bộ lọc (Chips)
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
@@ -1094,8 +1191,6 @@ class _HistoryPageState extends State<HistoryPage> {
             ),
           ),
           const SizedBox(height: 25),
-
-          // Danh sách Timeline
           Expanded(
             child: _isLoading
                 ? const Center(
@@ -1133,7 +1228,7 @@ class _HistoryPageState extends State<HistoryPage> {
         onSelected: (bool selected) {
           setState(() => _selectedFilter = label);
         },
-        selectedColor: const Color(0xFF00FFD0).withOpacity(0.2),
+        selectedColor: const Color(0xFF00FFD0).withValues(alpha: 0.2),
         labelStyle: TextStyle(
           color: isSelected ? const Color(0xFF00FFD0) : Colors.white60,
           fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
@@ -1178,7 +1273,7 @@ class _HistoryPageState extends State<HistoryPage> {
                   shape: BoxShape.circle,
                   boxShadow: [
                     BoxShadow(
-                      color: statusColor.withOpacity(0.4),
+                      color: statusColor.withValues(alpha: 0.4),
                       blurRadius: 6,
                     ),
                   ],
@@ -1188,7 +1283,7 @@ class _HistoryPageState extends State<HistoryPage> {
                 Expanded(
                   child: Container(
                     width: 2,
-                    color: Colors.white.withOpacity(0.05),
+                    color: Colors.white.withValues(alpha: 0.05),
                   ),
                 ),
             ],
@@ -1201,7 +1296,7 @@ class _HistoryPageState extends State<HistoryPage> {
               decoration: BoxDecoration(
                 color: const Color(0xFF1A1A1A),
                 borderRadius: BorderRadius.circular(15),
-                border: Border.all(color: Colors.white.withOpacity(0.03)),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.03)),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
